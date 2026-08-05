@@ -10,6 +10,7 @@ namespace Backend.Services;
 public class SessionService(AppDbContext db, IDataProtectionProvider dataProtectionProvider)
 {
     public const string CookieName = "netcrud_session";
+    private const int MaxSessionsPerUser = 5;
     private static readonly TimeSpan SessionDuration = TimeSpan.FromDays(7);
     private readonly IDataProtector _protector = dataProtectionProvider.CreateProtector("netcrud-session-key");
 
@@ -27,7 +28,34 @@ public class SessionService(AppDbContext db, IDataProtectionProvider dataProtect
         db.Sessions.Add(session);
         await db.SaveChangesAsync(cancellationToken);
 
+        await TrimSessionsAsync(userId, cancellationToken);
+
         return _protector.Protect(rawSessionKey);
+    }
+
+    public Task<int> DeleteExpiredSessionsAsync(CancellationToken cancellationToken = default) =>
+        db.Sessions
+            .Where(s => s.ExpiresAtUtc <= DateTime.UtcNow)
+            .ExecuteDeleteAsync(cancellationToken);
+
+    private async Task TrimSessionsAsync(int userId, CancellationToken cancellationToken)
+    {
+        var stale = await db.Sessions
+            .Where(s => s.UserId == userId)
+            .OrderByDescending(s => s.ExpiresAtUtc)
+            .ThenByDescending(s => s.Id)
+            .Skip(MaxSessionsPerUser)
+            .Select(s => s.Id)
+            .ToListAsync(cancellationToken);
+
+        if (stale.Count == 0)
+        {
+            return;
+        }
+
+        await db.Sessions
+            .Where(s => stale.Contains(s.Id))
+            .ExecuteDeleteAsync(cancellationToken);
     }
 
     public async Task<SessionValidationResult> ValidateCookieAsync(string encryptedCookieValue, CancellationToken cancellationToken = default)

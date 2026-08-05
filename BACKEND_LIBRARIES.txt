@@ -1,0 +1,227 @@
+NETCRUD BACKEND - LIBRARY / IMPORT BREAKDOWN
+============================================
+
+Source of truth: Backend/*.cs (excluding bin/ and obj/) and Backend/Backend.csproj
+
+NuGet packages referenced (Backend.csproj)
+------------------------------------------
+- Microsoft.EntityFrameworkCore 10.0.10
+- Microsoft.EntityFrameworkCore.Design 10.0.10 (dev-time only, PrivateAssets=all)
+- Npgsql 10.0.3
+- Npgsql.EntityFrameworkCore.PostgreSQL 10.0.3
+
+Project settings: net10.0, Nullable=enable, ImplicitUsings=enable
+
+
+1) ASP.NET Core hosting + middleware pipeline
+---------------------------------------------
+Files: Backend/Program.cs, Backend/Middleware/SessionAuthMiddleware.cs
+(Namespaces come in via ImplicitUsings: Microsoft.AspNetCore.Builder/Hosting/Http/Routing,
+ Microsoft.Extensions.Configuration/DependencyInjection/Hosting/Logging)
+
+Used members:
+- WebApplication.CreateBuilder(args)      -> creates host, config, DI container
+- Configuration.GetConnectionString(...)  -> reads "DefaultConnection"
+- Services.AddDbContext<AppDbContext>()   -> registers EF context
+- Services.AddDataProtection()            -> registers cookie encryption services
+- Services.AddScoped<PasswordService>()   -> per-request password service
+- Services.AddScoped<SessionService>()    -> per-request session service
+- Services.AddControllers()               -> MVC controller support
+- app.UseHttpsRedirection()                -> dev-only HTTPS redirect
+- app.UseAuthorization()                   -> authorization middleware slot
+- app.UseDefaultFiles() / UseStaticFiles() -> serves React build from wwwroot
+- app.UseMiddleware<SessionAuthMiddleware>() -> custom cookie-session auth gate
+- app.MapControllers()                     -> maps attribute-routed endpoints
+- app.MapFallbackToFile("index.html")      -> SPA fallback routing
+- app.Run()                                -> starts the server
+
+Types used in middleware:
+- RequestDelegate, HttpContext, PathString
+- PathString.StartsWithSegments("/api", StringComparison.OrdinalIgnoreCase)
+- HttpMethods.IsOptions(...)               -> lets CORS preflight through
+- Request.Cookies.TryGetValue / Response.Cookies.Delete
+- StatusCodes.Status401Unauthorized
+- HttpContext.Items["UserId"]              -> passes user id to controllers
+- HttpContext.RequestAborted               -> cancellation token
+
+Purpose: hosts the API + the compiled frontend, and blocks unauthenticated
+/api requests except /api/auth/signup and /api/auth/login.
+
+
+2) Microsoft.AspNetCore.Mvc
+---------------------------
+Files: Backend/Controllers/AuthController.cs, Backend/Controllers/api.cs
+
+Used attributes:
+- [ApiController], [Route], [HttpGet], [HttpPost], [HttpDelete]
+- [FromBody], [FromQuery]
+- Route constraint "{id:int}" on delete
+
+Used ControllerBase members / result helpers:
+- Ok(...), BadRequest(...), Conflict(...), Unauthorized(...), NotFound(), NoContent()
+- ActionResult<T>, IActionResult
+- Request.IsHttps, Request.Cookies, Response.Cookies.Append/Delete
+- CookieOptions { HttpOnly, Secure, SameSite = SameSiteMode.Lax, Expires, IsEssential }
+
+Purpose: exposes the HTTP API surface:
+- POST /api/auth/signup, /api/auth/login, /api/auth/logout
+- GET  /api/auth/me
+- GET  /api/products?filter=in-stock|out-of-stock
+- POST /api/products
+- DELETE /api/products/{id}
+
+
+3) Microsoft.EntityFrameworkCore (EF Core)
+------------------------------------------
+Files: Program.cs, Data/AppDbContext.cs, Data/AppDbContextFactory.cs,
+       Controllers/AuthController.cs, Controllers/api.cs, Services/SessionService.cs
+
+Configuration / modeling:
+- DbContext, DbContextOptions<T>, DbContextOptionsBuilder<T>
+- DbSet<T>, Set<T>()                       -> Users, Products, Sessions
+- OnModelCreating(ModelBuilder)
+- Entity<T>().HasIndex(...).IsUnique()      -> unique Email, unique Product.Name, unique SessionKeyHash
+- HasOne / WithMany / HasForeignKey / OnDelete(DeleteBehavior.Cascade)
+  -> Session belongs to User; deleting a user deletes their sessions
+
+Querying:
+- AsNoTracking()      -> read-only queries (product list, /me lookup)
+- AsTracking()        -> tracked query so an expired session can be deleted
+- AsQueryable()       -> allows conditional Where composition for the filter
+- Where(...), OrderBy(...)
+- FirstOrDefaultAsync(...), AnyAsync(...), ToListAsync()
+
+Writing:
+- Add(...), Remove(...), SaveChangesAsync(cancellationToken)
+
+Purpose: all database reads/writes for users, sessions, and products,
+plus the unique-constraint enforcement at the schema level.
+
+
+4) Npgsql + Npgsql.EntityFrameworkCore.PostgreSQL
+-------------------------------------------------
+Files: Program.cs, Data/AppDbContextFactory.cs, Migrations/*
+
+Used members:
+- options.UseNpgsql(connectionString)      -> selects the PostgreSQL provider
+- Npgsql.EntityFrameworkCore.PostgreSQL.Metadata
+  - NpgsqlValueGenerationStrategy.IdentityByDefaultColumn (migrations)
+  - NpgsqlModelBuilderExtensions.UseIdentityByDefaultColumns (snapshot)
+  - NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn (snapshot)
+
+Purpose: connects EF Core to PostgreSQL and emits Postgres-specific
+identity/column metadata in migrations.
+
+
+5) Microsoft.AspNetCore.DataProtection
+--------------------------------------
+Files: Program.cs (registration), Services/SessionService.cs (usage)
+
+Used members:
+- IDataProtectionProvider.CreateProtector("netcrud-session-key")
+- IDataProtector.Protect(rawSessionKey)    -> encrypts value written to the cookie
+- IDataProtector.Unprotect(cookieValue)    -> decrypts incoming cookie (throws if tampered)
+
+Purpose: the session cookie never contains a raw usable token; it is encrypted
+with an app key, and tampering causes Unprotect to throw and the session to fail.
+
+
+6) System.Security.Cryptography
+-------------------------------
+Files: Services/PasswordService.cs, Services/SessionService.cs
+
+Used members:
+- RandomNumberGenerator.GetBytes(n)        -> 16-byte password salt; 32-byte session key
+- Rfc2898DeriveBytes.Pbkdf2(...)           -> PBKDF2-SHA256, 100,000 iterations, 32-byte key
+- HashAlgorithmName.SHA256
+- CryptographicOperations.FixedTimeEquals  -> timing-attack-resistant hash comparison
+- SHA256.HashData(bytes)                   -> hashes the session key stored in the DB
+
+Purpose: password hashing/verification and session-token hashing.
+Stored password format: "{iterations}:{base64 salt}:{base64 key}".
+
+
+7) System.Text
+--------------
+Files: Services/PasswordService.cs, Services/SessionService.cs
+
+Used members:
+- Encoding.UTF8.GetBytes(string)
+
+Purpose: converts strings to bytes for the crypto APIs.
+
+
+8) System / core BCL helpers
+----------------------------
+Used members:
+- Convert.ToHexString / FromBase64String / ToBase64String
+- Guid.NewGuid().ToString("N")              -> session id
+- DateTime.UtcNow, TimeSpan.FromDays(7)     -> 7-day session lifetime
+- DateTimeOffset.UtcNow.AddDays(7)          -> cookie expiry
+- HashSet<string>                           -> public API path allow-list
+- string.Trim / ToLowerInvariant / IsNullOrWhiteSpace / Split / TrimEnd
+- int.TryParse
+
+Purpose: general string, time, and encoding work across services and controllers.
+
+
+9) System.ComponentModel.DataAnnotations
+----------------------------------------
+Files: Models/AppUser.cs, Models/Product.cs, Models/UserSession.cs
+
+Used attributes:
+- [MaxLength(n)]   -> maps to varchar(n) columns
+- [EmailAddress]   -> email format annotation on AppUser.Email
+
+Purpose: declares model constraints that EF translates into column types/sizes.
+
+
+10) EF Core Design + Migrations (dev-time)
+------------------------------------------
+Files: Data/AppDbContextFactory.cs, Migrations/*
+
+Used members:
+- IDesignTimeDbContextFactory<AppDbContext>.CreateDbContext(string[] args)
+  -> lets `dotnet ef` build a context without running the web host
+- Migration base class, MigrationBuilder:
+  CreateTable, AddColumn, CreateIndex, DropTable, DropColumn, DropIndex
+- Microsoft.EntityFrameworkCore.Infrastructure (ModelSnapshot, [DbContext])
+- Microsoft.EntityFrameworkCore.Storage.ValueConversion (generated snapshot import)
+
+Migrations present:
+- 20260729015016_InitialProducts          -> Products table
+- 20260729020541_AddAuthAndSessions       -> Users + Sessions tables and indexes
+- 20260802181139_AddProductQuantityAndUniqueName -> Products.Quantity + unique index on Name
+
+Purpose: schema creation and evolution via `dotnet ef migrations add` / `database update`.
+
+
+11) Implicit global usings (SDK generated)
+------------------------------------------
+Enabled by <ImplicitUsings>enable</ImplicitUsings>; generated into
+obj/*/Backend.GlobalUsings.g.cs:
+
+Microsoft.AspNetCore.Builder, Microsoft.AspNetCore.Hosting, Microsoft.AspNetCore.Http,
+Microsoft.AspNetCore.Routing, Microsoft.Extensions.Configuration,
+Microsoft.Extensions.DependencyInjection, Microsoft.Extensions.Hosting,
+Microsoft.Extensions.Logging, System, System.Collections.Generic, System.IO,
+System.Linq, System.Net.Http, System.Net.Http.Json, System.Threading,
+System.Threading.Tasks
+
+Purpose: these are why files can use HttpContext, Task, List<T>, LINQ, etc.
+without explicit using lines.
+
+
+QUICK REFERENCE: file -> external libraries
+-------------------------------------------
+Program.cs                  : ASP.NET Core hosting, EF Core, DataProtection (registration)
+Middleware/SessionAuthMiddleware.cs : ASP.NET Core Http abstractions
+Controllers/AuthController.cs       : ASP.NET Core MVC, EF Core
+Controllers/api.cs                  : ASP.NET Core MVC, EF Core, LINQ
+Data/AppDbContext.cs                : EF Core
+Data/AppDbContextFactory.cs         : EF Core, EF Core Design, Npgsql provider
+Services/PasswordService.cs         : System.Security.Cryptography, System.Text
+Services/SessionService.cs          : DataProtection, System.Security.Cryptography,
+                                      System.Text, EF Core
+Models/*.cs                         : System.ComponentModel.DataAnnotations
+Migrations/*.cs                     : EF Core Migrations, Npgsql metadata

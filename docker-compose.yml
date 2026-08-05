@@ -9,6 +9,9 @@ services:
     environment:
       ASPNETCORE_ENVIRONMENT: Development
       ConnectionStrings__DefaultConnection: Host=postgres;Port=5432;Database=netcrud;Username=netcrud;Password=netcrudpass
+      DataProtection__KeyRingPath: /var/netcrud/keys
+    volumes:
+      - dataprotection_keys:/var/netcrud/keys
     depends_on:
       postgres:
         condition: service_healthy
@@ -33,3 +36,4 @@ services:
 
 volumes:
   postgres_data:
+  dataprotection_keys:

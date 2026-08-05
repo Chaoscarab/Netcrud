@@ -22,4 +22,6 @@ public class AppUser
     public DateTime CreatedAtUtc { get; set; } = DateTime.UtcNow;
 
     public List<UserSession> Sessions { get; set; } = [];
+
+    public List<Product> Products { get; set; } = [];
 }

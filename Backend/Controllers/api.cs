@@ -15,13 +15,18 @@ public class ProductsController : ControllerBase
     }
 
     [HttpGet]
-    public async Task<ActionResult<IEnumerable<Product>>> Get([FromQuery] string? filter = null)
+    public async Task<ActionResult<IEnumerable<ProductResponse>>> Get([FromQuery] string? filter = null)
     {
+        if (!TryGetUserId(out var userId))
+        {
+            return Unauthorized();
+        }
+
         var normalizedFilter = filter?.Trim().ToLowerInvariant();
 
         var query = _db.Products
             .AsNoTracking()
-            .AsQueryable();
+            .Where(p => p.OwnerId == userId);
 
         if (normalizedFilter == "in-stock")
         {
@@ -34,14 +39,20 @@ public class ProductsController : ControllerBase
 
         var products = await query
             .OrderBy(p => p.Name)
-            .ToListAsync();
+            .Select(p => new ProductResponse(p.Id, p.Name, p.Quantity, p.Price))
+            .ToListAsync(HttpContext.RequestAborted);
 
         return Ok(products);
     }
 
     [HttpPost]
-    public async Task<ActionResult<Product>> Create([FromBody] CreateProductRequest request)
+    public async Task<ActionResult<ProductResponse>> Create([FromBody] CreateProductRequest request)
     {
+        if (!TryGetUserId(out var userId))
+        {
+            return Unauthorized();
+        }
+
         var name = request.Name.Trim();
         if (string.IsNullOrWhiteSpace(name))
         {
@@ -58,7 +69,9 @@ public class ProductsController : ControllerBase
             return BadRequest(new { message = "Price cannot be negative." });
         }
 
-        var nameExists = await _db.Products.AnyAsync(p => p.Name.ToLower() == name.ToLower());
+        var lowered = name.ToLowerInvariant();
+        var nameExists = await _db.Products
+            .AnyAsync(p => p.OwnerId == userId && p.NameLower == lowered, HttpContext.RequestAborted);
         if (nameExists)
         {
             return Conflict(new { message = "Product name must be unique." });
@@ -68,29 +81,59 @@ public class ProductsController : ControllerBase
         {
             Name = name,
             Quantity = request.Quantity,
-            Price = request.Price
+            Price = request.Price,
+            OwnerId = userId
         };
 
         _db.Products.Add(product);
-        await _db.SaveChangesAsync();
 
-        return Ok(product);
+        try
+        {
+            await _db.SaveChangesAsync(HttpContext.RequestAborted);
+        }
+        catch (DbUpdateException ex) when (ex.IsUniqueViolation())
+        {
+            return Conflict(new { message = "Product name must be unique." });
+        }
+
+        return Ok(new ProductResponse(product.Id, product.Name, product.Quantity, product.Price));
     }
 
     [HttpDelete("{id:int}")]
     public async Task<IActionResult> Delete(int id)
     {
-        var product = await _db.Products.FirstOrDefaultAsync(p => p.Id == id);
+        if (!TryGetUserId(out var userId))
+        {
+            return Unauthorized();
+        }
+
+        var product = await _db.Products
+            .FirstOrDefaultAsync(p => p.Id == id && p.OwnerId == userId, HttpContext.RequestAborted);
         if (product is null)
         {
+            // Same response whether the row is missing or owned by someone else.
             return NotFound();
         }
 
         _db.Products.Remove(product);
-        await _db.SaveChangesAsync();
+        await _db.SaveChangesAsync(HttpContext.RequestAborted);
 
         return NoContent();
     }
 
+    private bool TryGetUserId(out int userId)
+    {
+        if (HttpContext.Items.TryGetValue("UserId", out var value) && value is int id)
+        {
+            userId = id;
+            return true;
+        }
+
+        userId = 0;
+        return false;
+    }
+
     public sealed record CreateProductRequest(string Name, int Quantity, decimal Price);
+
+    public sealed record ProductResponse(int Id, string Name, int Quantity, decimal Price);
 }

@@ -2,12 +2,15 @@ using Backend.Data;
 using Backend.Models;
 using Backend.Services;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.EntityFrameworkCore;
 
 [ApiController]
 [Route("api/auth")]
 public class AuthController(AppDbContext db, PasswordService passwordService, SessionService sessionService) : ControllerBase
 {
+    public const string RateLimitPolicy = "auth";
+
     [HttpGet("me")]
     public async Task<IActionResult> Me()
     {
@@ -26,6 +29,7 @@ public class AuthController(AppDbContext db, PasswordService passwordService, Se
     }
 
     [HttpPost("signup")]
+    [EnableRateLimiting(RateLimitPolicy)]
     public async Task<ActionResult<UserResponse>> SignUp([FromBody] SignUpRequest request)
     {
         if (request.Password != request.ConfirmPassword)
@@ -49,15 +53,24 @@ public class AuthController(AppDbContext db, PasswordService passwordService, Se
         };
 
         db.Users.Add(user);
-        await db.SaveChangesAsync();
 
-        var cookieValue = await sessionService.CreateSessionCookieValueAsync(user.Id, HttpContext.RequestAborted);
-        SetSessionCookie(cookieValue);
+        try
+        {
+            await db.SaveChangesAsync();
+        }
+        catch (DbUpdateException ex) when (ex.IsUniqueViolation())
+        {
+            // Concurrent signup won the race; the unique index is the real guarantee.
+            return Conflict(new { message = "An account with this email already exists." });
+        }
+
+        await IssueSessionAsync(user.Id);
 
         return Ok(new UserResponse(user.Id, user.FirstName, user.LastName, user.Email));
     }
 
     [HttpPost("login")]
+    [EnableRateLimiting(RateLimitPolicy)]
     public async Task<ActionResult<UserResponse>> Login([FromBody] LoginRequest request)
     {
         var email = request.Email.Trim().ToLowerInvariant();
@@ -67,8 +80,7 @@ public class AuthController(AppDbContext db, PasswordService passwordService, Se
             return Unauthorized(new { message = "Invalid credentials." });
         }
 
-        var cookieValue = await sessionService.CreateSessionCookieValueAsync(user.Id, HttpContext.RequestAborted);
-        SetSessionCookie(cookieValue);
+        await IssueSessionAsync(user.Id);
 
         return Ok(new UserResponse(user.Id, user.FirstName, user.LastName, user.Email));
     }
@@ -83,6 +95,18 @@ public class AuthController(AppDbContext db, PasswordService passwordService, Se
 
         Response.Cookies.Delete(SessionService.CookieName);
         return NoContent();
+    }
+
+    private async Task IssueSessionAsync(int userId)
+    {
+        // Session fixation defence: drop any session presented on the authenticating request.
+        if (Request.Cookies.TryGetValue(SessionService.CookieName, out var existing) && !string.IsNullOrWhiteSpace(existing))
+        {
+            await sessionService.RevokeSessionAsync(existing, HttpContext.RequestAborted);
+        }
+
+        var cookieValue = await sessionService.CreateSessionCookieValueAsync(userId, HttpContext.RequestAborted);
+        SetSessionCookie(cookieValue);
     }
 
     private void SetSessionCookie(string cookieValue)
